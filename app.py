@@ -1,7 +1,7 @@
 """
 Obrain2 – Multi-Provider Multimodal Chat Assistant
 Supports: Google Gemma/Gemini, OpenRouter, Zhipu AI (GLM), DeepSeek, Alibaba Qwen, SiliconFlow, Moonshot (Kimi),
-compact attachment popover & preview chips, persistent API key management, and chat history via Supabase.
+unified prompt box container, persistent API key management, and chat history via Supabase.
 """
 
 import streamlit as st
@@ -118,19 +118,13 @@ if "session_id" not in st.session_state:
     st.session_state.session_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S") + "-" + str(uuid.uuid4())[:8]
 if "conversation_id" not in st.session_state:
     st.session_state.conversation_id = None
-if "pending_attachments" not in st.session_state:
-    st.session_state.pending_attachments = []  # list of dicts: {"id": str, "name": str, "type": str, "kind": str, "data": bytes}
-if "ignored_attachment_ids" not in st.session_state:
-    st.session_state.ignored_attachment_ids = set()
-if "uploader_key_version" not in st.session_state:
-    st.session_state.uploader_key_version = 0
+if "temp_attachments" not in st.session_state:
+    st.session_state.temp_attachments = []
 if "validation_status" not in st.session_state:
     st.session_state.validation_status = {}  # key_name -> (bool, str)
 
 def clear_attachments():
-    st.session_state.pending_attachments = []
-    st.session_state.ignored_attachment_ids = set()
-    st.session_state.uploader_key_version += 1
+    st.session_state.temp_attachments = []
 
 # ---------------------------------------------------------------------------
 # Supabase helpers
@@ -177,6 +171,14 @@ def get_total_storage_mb(sb: Client) -> float:
         return total / (1024 * 1024)
     except Exception:
         return 0.0
+
+def extract_text_from_pdf(pdf_bytes: bytes) -> str:
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        text = "\n".join(page.extract_text() or "" for page in reader.pages)
+        return text.strip() if text.strip() else "[PDF contained no extractable text]"
+    except Exception as e:
+        return f"[Could not read PDF: {e}]"
 
 # ---------------------------------------------------------------------------
 # Sidebar & Provider Settings
@@ -302,217 +304,194 @@ for msg in st.session_state.messages:
         st.markdown(msg["content"])
 
 # ---------------------------------------------------------------------------
-# Compact Attachment Popover & Active Attachment Previews
+# Consolidated Unified Prompt Box Layout
 # ---------------------------------------------------------------------------
-ver = st.session_state.uploader_key_version
-popover_col, clear_col = st.columns([3, 1])
+st.markdown("""
+    <style>
+    /* Styling Streamlit form as a single dark unified prompt box */
+    div[data-testid="stForm"] {
+        background-color: #1e1e24 !important;
+        border: 1px solid #374151 !important;
+        border-radius: 1rem !important;
+        padding: 0.5rem 0.75rem !important;
+        box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.3) !important;
+    }
+    div[data-testid="stForm"] section[data-testid="stFileUploader"] {
+        padding: 0 !important;
+    }
+    div[data-testid="stForm"] section[data-testid="stFileUploader"] label {
+        display: none !important;
+    }
+    div[data-testid="stForm"] section[data-testid="stFileUploader"] [data-testid="stFileUploaderDropzoneInstructions"] {
+        display: none !important;
+    }
+    div[data-testid="stForm"] button[kind="secondaryFormSubmit"] {
+        background-color: #374151 !important;
+        color: #ffffff !important;
+        border: none !important;
+        border-radius: 0.75rem !important;
+        padding: 0.5rem 1rem !important;
+    }
+    div[data-testid="stForm"] button[kind="secondaryFormSubmit"]:hover {
+        background-color: #4b5563 !important;
+    }
+    </style>
+""", unsafe_allow_html=True)
 
-with popover_col:
-    with st.popover("➕ Add Attachments (Images, Camera, PDF)", use_container_width=True):
-        st.markdown("### 📎 Attach Media or Documents")
+with st.form(key="unified_prompt_form", clear_on_submit=True):
+    # Dynamic preview chips inside the box container if attachments are selected
+    if st.session_state.get("temp_attachments"):
+        st.caption("📎 **Attached Files:**")
+        cols = st.columns(min(len(st.session_state.temp_attachments), 4))
+        for idx, file in enumerate(st.session_state.temp_attachments):
+            with cols[idx % 4]:
+                st.caption(f"📄 {file.name[:12]}...")
 
-        tab_img, tab_cam, tab_pdf = st.tabs(["🖼️ Gallery / Photos", "📷 Take Photo", "📄 Documents / PDF"])
+    # Main input row inside container: [Attach Upload Trigger] [Text Input] [Send Button]
+    col_attach, col_input, col_submit = st.columns([1.5, 6.5, 1], vertical_alignment="center")
 
-        with tab_img:
-            uploaded_imgs = st.file_uploader(
-                "Choose images",
-                type=["png", "jpg", "jpeg", "webp"],
-                accept_multiple_files=True,
-                key=f"popover_img_uploader_v{ver}"
-            )
-            if uploaded_imgs:
-                for f in uploaded_imgs:
-                    file_id = f"img_{f.name}_{f.size}"
-                    if file_id not in st.session_state.ignored_attachment_ids and not any(att["id"] == file_id for att in st.session_state.pending_attachments):
-                        st.session_state.pending_attachments.append({
-                            "id": file_id,
-                            "name": f.name,
-                            "type": f.type or "image/jpeg",
-                            "kind": "image",
-                            "data": f.getvalue()
-                        })
+    with col_attach:
+        uploaded_files = st.file_uploader(
+            "Add Attachments",
+            type=["png", "jpg", "jpeg", "pdf", "webp"],
+            accept_multiple_files=True,
+            label_visibility="collapsed",
+            key="file_uploader_widget"
+        )
 
-        with tab_cam:
-            cam_pic = st.camera_input("Take a photo", key=f"popover_cam_uploader_v{ver}")
-            if cam_pic:
-                cam_data = cam_pic.getvalue()
-                cam_id = f"cam_{len(cam_data)}"
-                if cam_id not in st.session_state.ignored_attachment_ids and not any(att["id"] == cam_id for att in st.session_state.pending_attachments):
-                    st.session_state.pending_attachments.append({
-                        "id": cam_id,
-                        "name": "Camera_photo.jpg",
-                        "type": "image/jpeg",
-                        "kind": "image",
-                        "data": cam_data
-                    })
+    with col_input:
+        prompt_text = st.text_input(
+            "Ask anything...",
+            placeholder="Ask anything...",
+            label_visibility="collapsed",
+            key="prompt_text_input"
+        )
 
-        with tab_pdf:
-            uploaded_pdfs = st.file_uploader(
-                "Choose PDF documents",
-                type=["pdf"],
-                accept_multiple_files=True,
-                key=f"popover_pdf_uploader_v{ver}"
-            )
-            if uploaded_pdfs:
-                for pdf in uploaded_pdfs:
-                    pdf_id = f"pdf_{pdf.name}_{pdf.size}"
-                    if pdf_id not in st.session_state.ignored_attachment_ids and not any(att["id"] == pdf_id for att in st.session_state.pending_attachments):
-                        st.session_state.pending_attachments.append({
-                            "id": pdf_id,
-                            "name": pdf.name,
-                            "type": "application/pdf",
-                            "kind": "pdf",
-                            "data": pdf.getvalue()
-                        })
+    with col_submit:
+        submitted = st.form_submit_button("↑", use_container_width=True)
 
-with clear_col:
-    if st.session_state.pending_attachments:
-        if st.button("🗑️ Clear All", use_container_width=True):
-            clear_attachments()
-            st.rerun()
+    if uploaded_files:
+        st.session_state.temp_attachments = uploaded_files
 
-# Display attachment chips above chat input
-if st.session_state.pending_attachments:
-    st.markdown("**Pending Attachments:**")
-    chip_cols = st.columns(min(len(st.session_state.pending_attachments), 4))
-    idx_to_remove = None
-    for idx, att in enumerate(st.session_state.pending_attachments):
-        col = chip_cols[idx % 4]
-        with col:
-            icon = "🖼️" if att["kind"] == "image" else "📄"
-            if st.button(f"❌ {icon} {att['name'][:15]}", key=f"chip_rm_{idx}_{att['id']}"):
-                idx_to_remove = idx
+if submitted:
+    attachments = st.session_state.temp_attachments or uploaded_files or []
+    if prompt_text.strip() or attachments:
+        safe_sec = get_safe_secrets()
+        provider_key_name = provider["key_name"]
+        active_api_key = key_manager.get_api_key(provider_key_name, safe_sec)
 
-    if idx_to_remove is not None:
-        removed_att = st.session_state.pending_attachments.pop(idx_to_remove)
-        st.session_state.ignored_attachment_ids.add(removed_att["id"])
-        st.rerun()
+        if not active_api_key:
+            st.error(f"Please configure an API key for {provider_name} in the sidebar settings first.")
+            st.stop()
 
-# ---------------------------------------------------------------------------
-# Chat input & generation
-# ---------------------------------------------------------------------------
-if user_prompt := st.chat_input("Ask anything..."):
-    # Current active provider & key
-    safe_sec = get_safe_secrets()
-    provider_key_name = provider["key_name"]
-    active_api_key = key_manager.get_api_key(provider_key_name, safe_sec)
+        # Process attachments
+        extra_text_parts = []
+        image_parts = []
+        pdf_count = 0
 
-    if not active_api_key:
-        st.error(f"Please configure an API key for {provider_name} in the sidebar settings first.")
-        st.stop()
+        for file in attachments:
+            file_bytes = file.getvalue()
+            mime_type = file.type or "application/octet-stream"
 
-    # Process attachments in session state
-    extra_text_parts = []
-    image_parts = []
-    pdf_count = 0
+            if mime_type.startswith("image/"):
+                image_parts.append((mime_type, file_bytes))
+                extra_text_parts.append(f"[User attached image: {file.name}]")
+            elif mime_type == "application/pdf" or file.name.lower().endswith(".pdf"):
+                pdf_count += 1
+                pdf_text = extract_text_from_pdf(file_bytes)
+                extra_text_parts.append(f"[Content of PDF {file.name}]:\n{pdf_text[:12000]}")
 
-    for att in st.session_state.pending_attachments:
-        if att["kind"] == "image":
-            image_parts.append((att["type"], att["data"]))
-            extra_text_parts.append(f"[User attached image: {att['name']}]")
-        elif att["kind"] == "pdf":
-            pdf_count += 1
+        full_user_content = prompt_text
+        if extra_text_parts:
+            full_user_content = (prompt_text + "\n\n" + "\n\n".join(extra_text_parts)).strip()
+
+        # Display & store user message
+        st.session_state.messages.append({"role": "user", "content": full_user_content})
+        with st.chat_message("user"):
+            st.markdown(prompt_text if prompt_text.strip() else "*(Sent attachment)*")
+            if image_parts:
+                st.caption(f"📎 {len(image_parts)} image(s) attached")
+            if pdf_count > 0:
+                st.caption(f"📄 {pdf_count} PDF(s) attached")
+
+        if use_persistence and st.session_state.conversation_id:
+            sb = get_supabase()
+            if sb:
+                save_message(sb, st.session_state.conversation_id, "user", full_user_content)
+
+        # Reset attachments after submission
+        clear_attachments()
+
+        # Generate reply
+        with st.chat_message("assistant"):
+            placeholder = st.empty()
+            placeholder.markdown("Thinking…")
+
             try:
-                reader = PdfReader(io.BytesIO(att["data"]))
-                text = "\n".join(page.extract_text() or "" for page in reader.pages)
-                if text.strip():
-                    extra_text_parts.append(f"[Content of PDF {att['name']}]:\n{text[:12000]}")
-                else:
-                    extra_text_parts.append(f"[PDF {att['name']} contained no extractable text]")
-            except Exception as e:
-                extra_text_parts.append(f"[Could not read PDF {att['name']}: {e}]")
+                assistant_text = ""
 
-    full_user_content = user_prompt
-    if extra_text_parts:
-        full_user_content = user_prompt + "\n\n" + "\n\n".join(extra_text_parts)
+                if provider["type"] == "google":
+                    client = genai.Client(api_key=active_api_key)
 
-    # Display & store user message
-    st.session_state.messages.append({"role": "user", "content": full_user_content})
-    with st.chat_message("user"):
-        st.markdown(user_prompt)
-        if image_parts:
-            st.caption(f"📎 {len(image_parts)} image(s) attached")
-        if pdf_count > 0:
-            st.caption(f"📄 {pdf_count} PDF(s) attached")
+                    history = []
+                    for m in st.session_state.messages[:-1]:
+                        role = "user" if m["role"] == "user" else "model"
+                        history.append(types.Content(role=role, parts=[types.Part.from_text(text=m["content"])]))
 
-    if use_persistence and st.session_state.conversation_id:
-        sb = get_supabase()
-        if sb:
-            save_message(sb, st.session_state.conversation_id, "user", full_user_content)
+                    chat = client.chats.create(
+                        model=model_choice,
+                        history=history,
+                        config=types.GenerateContentConfig(
+                            temperature=temperature,
+                            system_instruction=system_prompt,
+                        ),
+                    )
+                    response = chat.send_message(full_user_content)
+                    assistant_text = response.text or "(empty response)"
 
-    # Clear pending attachments after sending
-    clear_attachments()
+                else:  # OpenAI-compatible (OpenRouter, Zhipu, DeepSeek, Qwen, SiliconFlow, Moonshot)
+                    client = OpenAI(
+                        base_url=provider["base_url"],
+                        api_key=active_api_key,
+                    )
+                    msgs = [{"role": "system", "content": system_prompt}]
+                    for m in st.session_state.messages[:-1]:
+                        msgs.append({"role": m["role"], "content": m["content"]})
 
-    # Generate reply
-    with st.chat_message("assistant"):
-        placeholder = st.empty()
-        placeholder.markdown("Thinking…")
+                    content_list = [{"type": "text", "text": full_user_content}]
+                    for mime, data in image_parts:
+                        b64 = base64.b64encode(data).decode()
+                        content_list.append({
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{mime};base64,{b64}"},
+                        })
+                    msgs.append({"role": "user", "content": content_list if image_parts else full_user_content})
 
-        try:
-            assistant_text = ""
-
-            if provider["type"] == "google":
-                client = genai.Client(api_key=active_api_key)
-
-                # Build history
-                history = []
-                for m in st.session_state.messages[:-1]:
-                    role = "user" if m["role"] == "user" else "model"
-                    history.append(types.Content(role=role, parts=[types.Part.from_text(text=m["content"])]))
-
-                chat = client.chats.create(
-                    model=model_choice,
-                    history=history,
-                    config=types.GenerateContentConfig(
+                    completion = client.chat.completions.create(
+                        model=model_choice,
+                        messages=msgs,
                         temperature=temperature,
-                        system_instruction=system_prompt,
-                    ),
-                )
-                response = chat.send_message(full_user_content)
-                assistant_text = response.text or "(empty response)"
+                    )
+                    assistant_text = completion.choices[0].message.content or "(empty response)"
 
-            else:  # OpenAI-compatible (OpenRouter, Zhipu, DeepSeek, Qwen, SiliconFlow, Moonshot)
-                client = OpenAI(
-                    base_url=provider["base_url"],
-                    api_key=active_api_key,
-                )
-                msgs = [{"role": "system", "content": system_prompt}]
-                for m in st.session_state.messages[:-1]:
-                    msgs.append({"role": m["role"], "content": m["content"]})
+                placeholder.markdown(assistant_text)
+                st.session_state.messages.append({"role": "assistant", "content": assistant_text})
 
-                # Build content for last user turn (text + optional images as data URLs)
-                content_list = [{"type": "text", "text": full_user_content}]
-                for mime, data in image_parts:
-                    b64 = base64.b64encode(data).decode()
-                    content_list.append({
-                        "type": "image_url",
-                        "image_url": {"url": f"data:{mime};base64,{b64}"},
-                    })
-                msgs.append({"role": "user", "content": content_list if image_parts else full_user_content})
+                if use_persistence and st.session_state.conversation_id:
+                    sb = get_supabase()
+                    if sb:
+                        save_message(sb, st.session_state.conversation_id, "assistant", assistant_text)
 
-                completion = client.chat.completions.create(
-                    model=model_choice,
-                    messages=msgs,
-                    temperature=temperature,
-                )
-                assistant_text = completion.choices[0].message.content or "(empty response)"
+            except Exception as e:
+                err = str(e)
+                if "503" in err or "high demand" in err.lower() or "unavailable" in err.lower():
+                    friendly = "Model temporarily overloaded (503). Please try again in a minute or switch model."
+                elif "401" in err or "auth" in err.lower() or "api key" in err.lower() or "unauthorized" in err.lower():
+                    friendly = "Authentication failed. Check your API key in settings."
+                elif "429" in err or "rate" in err.lower() or "quota" in err.lower():
+                    friendly = "Rate limit / quota exceeded. Wait or switch provider."
+                else:
+                    friendly = f"Error: {err}"
+                placeholder.error(friendly)
 
-            placeholder.markdown(assistant_text)
-            st.session_state.messages.append({"role": "assistant", "content": assistant_text})
-
-            if use_persistence and st.session_state.conversation_id:
-                sb = get_supabase()
-                if sb:
-                    save_message(sb, st.session_state.conversation_id, "assistant", assistant_text)
-
-        except Exception as e:
-            err = str(e)
-            if "503" in err or "high demand" in err.lower() or "unavailable" in err.lower():
-                friendly = "Model temporarily overloaded (503). Please try again in a minute or switch model."
-            elif "401" in err or "auth" in err.lower() or "api key" in err.lower() or "unauthorized" in err.lower():
-                friendly = "Authentication failed. Check your API key in settings."
-            elif "429" in err or "rate" in err.lower() or "quota" in err.lower():
-                friendly = "Rate limit / quota exceeded. Wait or switch provider."
-            else:
-                friendly = f"Error: {err}"
-            placeholder.error(friendly)
+        st.rerun()
