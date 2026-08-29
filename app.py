@@ -1,7 +1,7 @@
 """
 Obrain2 – Multi-Provider Multimodal Chat Assistant
 Supports: Google Gemma/Gemini, OpenRouter, Zhipu AI (GLM), DeepSeek, Alibaba Qwen, SiliconFlow, Moonshot (Kimi),
-unified prompt box container, persistent API key management, and chat history via Supabase.
+sticky bottom unified prompt container, persistent API key management, named chat sessions, and history via Supabase.
 """
 
 import streamlit as st
@@ -106,25 +106,7 @@ DEFAULT_SYSTEM = (
     "analyse them carefully and base your answer on their content."
 )
 
-MAX_FILE_MB = 8          # soft limit per file
 WARN_STORAGE_MB = 400    # warn when total uploaded files approach free tier
-
-# ---------------------------------------------------------------------------
-# Session state initialization
-# ---------------------------------------------------------------------------
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "session_id" not in st.session_state:
-    st.session_state.session_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S") + "-" + str(uuid.uuid4())[:8]
-if "conversation_id" not in st.session_state:
-    st.session_state.conversation_id = None
-if "temp_attachments" not in st.session_state:
-    st.session_state.temp_attachments = []
-if "validation_status" not in st.session_state:
-    st.session_state.validation_status = {}  # key_name -> (bool, str)
-
-def clear_attachments():
-    st.session_state.temp_attachments = []
 
 # ---------------------------------------------------------------------------
 # Supabase helpers
@@ -140,29 +122,44 @@ def get_supabase() -> Optional[Client]:
         pass
     return None
 
-def ensure_conversation(sb: Client, session_id: str) -> str:
-    """Return conversation uuid for this session, creating one if needed."""
-    res = sb.table("conversations").select("id").eq("session_id", session_id).execute()
-    if res.data:
-        return res.data[0]["id"]
+def load_conversations_from_supabase(sb: Client, session_id: str) -> List[Dict]:
+    try:
+        res = sb.table("conversations").select("id, title, created_at").eq("session_id", session_id).order("created_at").execute()
+        return res.data or []
+    except Exception:
+        return []
+
+def create_supabase_conversation(sb: Client, session_id: str, title: str) -> str:
     new_id = str(uuid.uuid4())
     sb.table("conversations").insert({
         "id": new_id,
         "session_id": session_id,
-        "title": f"Chat {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}",
+        "title": title,
     }).execute()
     return new_id
 
-def load_messages(sb: Client, conversation_id: str) -> List[Dict]:
-    res = sb.table("messages").select("role, content").eq("conversation_id", conversation_id).order("created_at").execute()
-    return [{"role": r["role"], "content": r["content"]} for r in (res.data or [])]
+def update_supabase_conversation_title(sb: Client, conversation_id: str, new_title: str):
+    try:
+        sb.table("conversations").update({"title": new_title, "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", conversation_id).execute()
+    except Exception:
+        pass
 
-def save_message(sb: Client, conversation_id: str, role: str, content: str):
-    sb.table("messages").insert({
-        "conversation_id": conversation_id,
-        "role": role,
-        "content": content,
-    }).execute()
+def load_messages_from_supabase(sb: Client, conversation_id: str) -> List[Dict]:
+    try:
+        res = sb.table("messages").select("role, content").eq("conversation_id", conversation_id).order("created_at").execute()
+        return [{"role": r["role"], "content": r["content"]} for r in (res.data or [])]
+    except Exception:
+        return []
+
+def save_message_to_supabase(sb: Client, conversation_id: str, role: str, content: str):
+    try:
+        sb.table("messages").insert({
+            "conversation_id": conversation_id,
+            "role": role,
+            "content": content,
+        }).execute()
+    except Exception:
+        pass
 
 def get_total_storage_mb(sb: Client) -> float:
     try:
@@ -181,9 +178,80 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
         return f"[Could not read PDF: {e}]"
 
 # ---------------------------------------------------------------------------
-# Sidebar & Provider Settings
+# Session state initialization & chat manager
+# ---------------------------------------------------------------------------
+if "session_id" not in st.session_state:
+    st.session_state.session_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S") + "-" + str(uuid.uuid4())[:8]
+
+if "chats" not in st.session_state:
+    st.session_state.chats = {}
+
+if "current_chat" not in st.session_state:
+    st.session_state.current_chat = "New Chat"
+
+if "temp_attachments" not in st.session_state:
+    st.session_state.temp_attachments = []
+
+if "validation_status" not in st.session_state:
+    st.session_state.validation_status = {}
+
+def clear_attachments():
+    st.session_state.temp_attachments = []
+
+# Check persistence toggle state (default True)
+use_persistence = st.session_state.get("use_persistence", True)
+sb = get_supabase() if use_persistence else None
+
+# Synchronize session_state.chats with Supabase on initial load if empty
+if sb and not st.session_state.chats:
+    db_convs = load_conversations_from_supabase(sb, st.session_state.session_id)
+    if db_convs:
+        for c in db_convs:
+            c_title = c.get("title") or "Untitled Chat"
+            msgs = load_messages_from_supabase(sb, c["id"])
+            st.session_state.chats[c_title] = {"id": c["id"], "messages": msgs}
+        st.session_state.current_chat = list(st.session_state.chats.keys())[0]
+
+if not st.session_state.chats:
+    default_title = "New Chat"
+    conv_id = create_supabase_conversation(sb, st.session_state.session_id, default_title) if sb else None
+    st.session_state.chats[default_title] = {"id": conv_id, "messages": []}
+    st.session_state.current_chat = default_title
+
+if st.session_state.current_chat not in st.session_state.chats:
+    st.session_state.current_chat = list(st.session_state.chats.keys())[0]
+
+# ---------------------------------------------------------------------------
+# Sidebar: Navigation & Settings
 # ---------------------------------------------------------------------------
 with st.sidebar:
+    st.subheader("💬 Chats")
+
+    if st.button("➕ New Chat", use_container_width=True):
+        chat_count = len(st.session_state.chats) + 1
+        new_name = f"Chat {chat_count}"
+        new_conv_id = create_supabase_conversation(sb, st.session_state.session_id, new_name) if sb else None
+        st.session_state.chats[new_name] = {"id": new_conv_id, "messages": []}
+        st.session_state.current_chat = new_name
+        clear_attachments()
+        st.rerun()
+
+    st.markdown("---")
+
+    chat_names = list(st.session_state.chats.keys())
+    selected_chat = st.radio(
+        "Saved Conversations",
+        chat_names,
+        index=chat_names.index(st.session_state.current_chat) if st.session_state.current_chat in chat_names else 0,
+        label_visibility="collapsed",
+    )
+
+    if selected_chat != st.session_state.current_chat:
+        st.session_state.current_chat = selected_chat
+        clear_attachments()
+        st.rerun()
+
+    st.divider()
     st.header("🧠 Obrain2 Settings")
 
     provider_name = st.selectbox("Provider", list(PROVIDERS.keys()))
@@ -250,71 +318,67 @@ with st.sidebar:
             st.markdown("---")
 
     st.divider()
-    use_persistence = st.checkbox("Persist chats to Supabase", value=True)
-    if use_persistence:
-        sb = get_supabase()
-        if sb:
-            used_mb = get_total_storage_mb(sb)
-            st.caption(f"Uploaded files storage: ~{used_mb:.1f} MB")
-            if used_mb > WARN_STORAGE_MB:
-                st.warning("Approaching Supabase free storage limit. Consider deleting old files.")
-        else:
-            st.caption("Supabase credentials not active or not configured in secrets.")
+    persist_toggle = st.checkbox("Persist chats to Supabase", value=use_persistence, key="use_persistence")
+    if persist_toggle and sb:
+        used_mb = get_total_storage_mb(sb)
+        st.caption(f"Uploaded files storage: ~{used_mb:.1f} MB")
+        if used_mb > WARN_STORAGE_MB:
+            st.warning("Approaching Supabase free storage limit. Consider deleting old files.")
+    elif persist_toggle and not sb:
+        st.caption("Supabase credentials not active or not configured in secrets.")
 
     col1, col2 = st.columns(2)
     with col1:
         if st.button("Clear current chat", use_container_width=True):
-            st.session_state.messages = []
-            st.session_state.conversation_id = None
+            current_chat_data = st.session_state.chats[st.session_state.current_chat]
+            current_chat_data["messages"] = []
             clear_attachments()
             st.rerun()
     with col2:
-        if st.session_state.get("messages"):
-            md_lines = ["# Obrain2 Chat Export", f"*Exported: {datetime.now(timezone.utc).isoformat()}*", ""]
-            for msg in st.session_state.messages:
+        active_messages = st.session_state.chats[st.session_state.current_chat]["messages"]
+        if active_messages:
+            md_lines = ["# Obrain2 Chat Export", f"*Chat: {st.session_state.current_chat}*", f"*Exported: {datetime.now(timezone.utc).isoformat()}*", ""]
+            for msg in active_messages:
                 role = "User" if msg["role"] == "user" else "Assistant"
                 md_lines.append(f"**{role}:**\n{msg['content']}\n")
             md_content = "\n".join(md_lines)
             st.download_button(
                 label="Export MD",
                 data=md_content,
-                file_name=f"obrain2_chat_{st.session_state.get('session_id', 'export')}.md",
+                file_name=f"obrain2_chat_{st.session_state.current_chat.replace(' ', '_')}.md",
                 mime="text/markdown",
                 use_container_width=True,
             )
 
-# Load history from Supabase once
-if use_persistence and st.session_state.conversation_id is None:
-    sb = get_supabase()
-    if sb:
-        conv_id = ensure_conversation(sb, st.session_state.session_id)
-        st.session_state.conversation_id = conv_id
-        if not st.session_state.messages:
-            st.session_state.messages = load_messages(sb, conv_id)
-
 # ---------------------------------------------------------------------------
-# Main UI
-# ---------------------------------------------------------------------------
-st.title("🧠 Obrain2 AI Assistant")
-st.caption("Multi-provider · Multimodal · Persistent memory")
-
-# Render history
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
-
-# ---------------------------------------------------------------------------
-# Consolidated Unified Prompt Box Layout
+# STICKY BOTTOM CSS & STYLING
 # ---------------------------------------------------------------------------
 st.markdown("""
     <style>
-    /* Styling Streamlit form as a single dark unified prompt box */
+    /* Pin the input wrapper container strictly to viewport bottom */
+    .st-fixed-bottom {
+        position: fixed;
+        bottom: 0;
+        left: 0;
+        right: 0;
+        background-color: #131316;
+        padding: 0.75rem 1rem 1rem 1rem;
+        z-index: 99999;
+        border-top: 1px solid #2d2d35;
+        box-shadow: 0 -4px 15px rgba(0,0,0,0.4);
+    }
+    /* Padding to prevent chat history from hiding behind fixed bottom prompt bar */
+    .block-container {
+        padding-bottom: 10rem !important;
+    }
     div[data-testid="stForm"] {
         background-color: #1e1e24 !important;
         border: 1px solid #374151 !important;
         border-radius: 1rem !important;
         padding: 0.5rem 0.75rem !important;
         box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.3) !important;
+        max-width: 800px;
+        margin: 0 auto;
     }
     div[data-testid="stForm"] section[data-testid="stFileUploader"] {
         padding: 0 !important;
@@ -338,8 +402,25 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-with st.form(key="unified_prompt_form", clear_on_submit=True):
-    # Dynamic preview chips inside the box container if attachments are selected
+# ---------------------------------------------------------------------------
+# Main UI - Active Chat History Display
+# ---------------------------------------------------------------------------
+st.title("🧠 Obrain2 AI Assistant")
+st.caption(f"Session: **{st.session_state.current_chat}** · Multi-provider · Multimodal · Persistent memory")
+
+current_chat_data = st.session_state.chats[st.session_state.current_chat]
+current_messages = current_chat_data["messages"]
+
+for msg in current_messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+
+# ---------------------------------------------------------------------------
+# Sticky Prompt Form Container
+# ---------------------------------------------------------------------------
+st.markdown('<div class="st-fixed-bottom">', unsafe_allow_html=True)
+
+with st.form(key="sticky_prompt_form", clear_on_submit=True):
     if st.session_state.get("temp_attachments"):
         st.caption("📎 **Attached Files:**")
         cols = st.columns(min(len(st.session_state.temp_attachments), 4))
@@ -347,7 +428,6 @@ with st.form(key="unified_prompt_form", clear_on_submit=True):
             with cols[idx % 4]:
                 st.caption(f"📄 {file.name[:12]}...")
 
-    # Main input row inside container: [Attach Upload Trigger] [Text Input] [Send Button]
     col_attach, col_input, col_submit = st.columns([1.5, 6.5, 1], vertical_alignment="center")
 
     with col_attach:
@@ -356,15 +436,15 @@ with st.form(key="unified_prompt_form", clear_on_submit=True):
             type=["png", "jpg", "jpeg", "pdf", "webp"],
             accept_multiple_files=True,
             label_visibility="collapsed",
-            key="file_uploader_widget"
+            key="bottom_file_uploader",
         )
 
     with col_input:
-        prompt_text = st.text_input(
+        prompt_input = st.text_input(
             "Ask anything...",
             placeholder="Ask anything...",
             label_visibility="collapsed",
-            key="prompt_text_input"
+            key="bottom_prompt_input",
         )
 
     with col_submit:
@@ -373,9 +453,13 @@ with st.form(key="unified_prompt_form", clear_on_submit=True):
     if uploaded_files:
         st.session_state.temp_attachments = uploaded_files
 
+st.markdown('</div>', unsafe_allow_html=True)
+
 if submitted:
     attachments = st.session_state.temp_attachments or uploaded_files or []
-    if prompt_text.strip() or attachments:
+    prompt_text = prompt_input.strip()
+
+    if prompt_text or attachments:
         safe_sec = get_safe_secrets()
         provider_key_name = provider["key_name"]
         active_api_key = key_manager.get_api_key(provider_key_name, safe_sec)
@@ -383,6 +467,9 @@ if submitted:
         if not active_api_key:
             st.error(f"Please configure an API key for {provider_name} in the sidebar settings first.")
             st.stop()
+
+        # Model Routing Validation: Gemma vs. Gemini / Multimodal models
+        is_gemma = "gemma" in model_choice.lower()
 
         # Process attachments
         extra_text_parts = []
@@ -394,7 +481,10 @@ if submitted:
             mime_type = file.type or "application/octet-stream"
 
             if mime_type.startswith("image/"):
-                image_parts.append((mime_type, file_bytes))
+                if is_gemma:
+                    st.warning(f"⚠️ Model '{model_choice}' is text-only. Processing query without image payload '{file.name}'.")
+                else:
+                    image_parts.append((mime_type, file_bytes))
                 extra_text_parts.append(f"[User attached image: {file.name}]")
             elif mime_type == "application/pdf" or file.name.lower().endswith(".pdf"):
                 pdf_count += 1
@@ -405,93 +495,109 @@ if submitted:
         if extra_text_parts:
             full_user_content = (prompt_text + "\n\n" + "\n\n".join(extra_text_parts)).strip()
 
-        # Display & store user message
-        st.session_state.messages.append({"role": "user", "content": full_user_content})
-        with st.chat_message("user"):
-            st.markdown(prompt_text if prompt_text.strip() else "*(Sent attachment)*")
-            if image_parts:
-                st.caption(f"📎 {len(image_parts)} image(s) attached")
-            if pdf_count > 0:
-                st.caption(f"📄 {pdf_count} PDF(s) attached")
+        # Dynamic Auto-renaming of generic chat title on initial prompt
+        if (st.session_state.current_chat.startswith("Chat ") or st.session_state.current_chat == "New Chat") and len(current_messages) == 0:
+            if prompt_text:
+                new_title = prompt_text[:22] + "..." if len(prompt_text) > 22 else prompt_text
+            else:
+                new_title = "Attachment Chat"
 
-        if use_persistence and st.session_state.conversation_id:
-            sb = get_supabase()
-            if sb:
-                save_message(sb, st.session_state.conversation_id, "user", full_user_content)
+            # Avoid collision with existing titles
+            base_new_title = new_title
+            counter = 1
+            while new_title in st.session_state.chats and new_title != st.session_state.current_chat:
+                new_title = f"{base_new_title} ({counter})"
+                counter += 1
 
-        # Reset attachments after submission
+            conv_obj = st.session_state.chats.pop(st.session_state.current_chat)
+            st.session_state.chats[new_title] = conv_obj
+            st.session_state.current_chat = new_title
+
+            if persist_toggle and sb and conv_obj.get("id"):
+                update_supabase_conversation_title(sb, conv_obj["id"], new_title)
+
+        active_chat = st.session_state.chats[st.session_state.current_chat]
+        active_msgs = active_chat["messages"]
+
+        # Store user message
+        active_msgs.append({"role": "user", "content": full_user_content})
+
+        if persist_toggle and sb and active_chat.get("id"):
+            save_message_to_supabase(sb, active_chat["id"], "user", full_user_content)
+
         clear_attachments()
 
-        # Generate reply
-        with st.chat_message("assistant"):
-            placeholder = st.empty()
-            placeholder.markdown("Thinking…")
+        # Generate response
+        try:
+            assistant_text = ""
 
-            try:
-                assistant_text = ""
+            if provider["type"] == "google":
+                client = genai.Client(api_key=active_api_key)
 
-                if provider["type"] == "google":
-                    client = genai.Client(api_key=active_api_key)
+                history = []
+                for m in active_msgs[:-1]:
+                    role = "user" if m["role"] == "user" else "model"
+                    history.append(types.Content(role=role, parts=[types.Part.from_text(text=m["content"])]))
 
-                    history = []
-                    for m in st.session_state.messages[:-1]:
-                        role = "user" if m["role"] == "user" else "model"
-                        history.append(types.Content(role=role, parts=[types.Part.from_text(text=m["content"])]))
+                # Gemini multimodal parts handling vs Gemma text handling
+                user_parts = [types.Part.from_text(text=full_user_content)]
+                if not is_gemma:
+                    for mime, data in image_parts:
+                        user_parts.append(types.Part.from_bytes(data=data, mime_type=mime))
 
-                    chat = client.chats.create(
-                        model=model_choice,
-                        history=history,
-                        config=types.GenerateContentConfig(
-                            temperature=temperature,
-                            system_instruction=system_prompt,
-                        ),
-                    )
-                    response = chat.send_message(full_user_content)
-                    assistant_text = response.text or "(empty response)"
+                chat = client.chats.create(
+                    model=model_choice,
+                    history=history,
+                    config=types.GenerateContentConfig(
+                        temperature=temperature,
+                        system_instruction=system_prompt,
+                    ),
+                )
+                response = chat.send_message(user_parts)
+                assistant_text = response.text or "(empty response)"
 
-                else:  # OpenAI-compatible (OpenRouter, Zhipu, DeepSeek, Qwen, SiliconFlow, Moonshot)
-                    client = OpenAI(
-                        base_url=provider["base_url"],
-                        api_key=active_api_key,
-                    )
-                    msgs = [{"role": "system", "content": system_prompt}]
-                    for m in st.session_state.messages[:-1]:
-                        msgs.append({"role": m["role"], "content": m["content"]})
+            else:  # OpenAI-compatible providers
+                client = OpenAI(
+                    base_url=provider["base_url"],
+                    api_key=active_api_key,
+                )
+                msgs = [{"role": "system", "content": system_prompt}]
+                for m in active_msgs[:-1]:
+                    msgs.append({"role": m["role"], "content": m["content"]})
 
-                    content_list = [{"type": "text", "text": full_user_content}]
+                content_list = [{"type": "text", "text": full_user_content}]
+                if not is_gemma:
                     for mime, data in image_parts:
                         b64 = base64.b64encode(data).decode()
                         content_list.append({
                             "type": "image_url",
                             "image_url": {"url": f"data:{mime};base64,{b64}"},
                         })
-                    msgs.append({"role": "user", "content": content_list if image_parts else full_user_content})
 
-                    completion = client.chat.completions.create(
-                        model=model_choice,
-                        messages=msgs,
-                        temperature=temperature,
-                    )
-                    assistant_text = completion.choices[0].message.content or "(empty response)"
+                msgs.append({"role": "user", "content": content_list if (image_parts and not is_gemma) else full_user_content})
 
-                placeholder.markdown(assistant_text)
-                st.session_state.messages.append({"role": "assistant", "content": assistant_text})
+                completion = client.chat.completions.create(
+                    model=model_choice,
+                    messages=msgs,
+                    temperature=temperature,
+                )
+                assistant_text = completion.choices[0].message.content or "(empty response)"
 
-                if use_persistence and st.session_state.conversation_id:
-                    sb = get_supabase()
-                    if sb:
-                        save_message(sb, st.session_state.conversation_id, "assistant", assistant_text)
+            active_msgs.append({"role": "assistant", "content": assistant_text})
 
-            except Exception as e:
-                err = str(e)
-                if "503" in err or "high demand" in err.lower() or "unavailable" in err.lower():
-                    friendly = "Model temporarily overloaded (503). Please try again in a minute or switch model."
-                elif "401" in err or "auth" in err.lower() or "api key" in err.lower() or "unauthorized" in err.lower():
-                    friendly = "Authentication failed. Check your API key in settings."
-                elif "429" in err or "rate" in err.lower() or "quota" in err.lower():
-                    friendly = "Rate limit / quota exceeded. Wait or switch provider."
-                else:
-                    friendly = f"Error: {err}"
-                placeholder.error(friendly)
+            if persist_toggle and sb and active_chat.get("id"):
+                save_message_to_supabase(sb, active_chat["id"], "assistant", assistant_text)
+
+        except Exception as e:
+            err = str(e)
+            if "503" in err or "high demand" in err.lower() or "unavailable" in err.lower():
+                friendly = "Model temporarily overloaded (503). Please try again in a minute or switch model."
+            elif "401" in err or "auth" in err.lower() or "api key" in err.lower() or "unauthorized" in err.lower():
+                friendly = "Authentication failed. Check your API key in settings."
+            elif "429" in err or "rate" in err.lower() or "quota" in err.lower():
+                friendly = "Rate limit / quota exceeded. Wait or switch provider."
+            else:
+                friendly = f"Error: {err}"
+            active_msgs.append({"role": "assistant", "content": f"⚠️ {friendly}"})
 
         st.rerun()
