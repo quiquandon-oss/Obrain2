@@ -47,7 +47,10 @@ PROVIDERS = {
         "type": "google",
         "key_name": "GEMINI_API_KEY",
         "base_url": None,
-        "models": ["gemma-4-26b-a4b-it", "gemma-4-31b-it", "gemini-2.5-flash", "gemini-2.5-pro"],
+        "models": [
+            "gemini-3.6-flash",
+            "gemma-2-2b-it",
+        ],
     },
     "OpenRouter": {
         "type": "openai_compatible",
@@ -56,8 +59,8 @@ PROVIDERS = {
         "models": [
             "google/gemma-4-26b-a4b-it",
             "google/gemma-4-31b-it",
-            "qwen/qwen3-32b",
-            "qwen/qwen3-72b",
+            "qwen/qwen3.7-plus",
+            "qwen/qwen-2.5-72b-instruct",
             "deepseek/deepseek-chat",
             "deepseek/deepseek-reasoner",
             "z-ai/glm-4.5-flash",
@@ -67,7 +70,11 @@ PROVIDERS = {
         "type": "openai_compatible",
         "key_name": "ZHIPU_API_KEY",
         "base_url": "https://open.bigmodel.cn/api/paas/v4",
-        "models": ["glm-4-flash", "glm-4", "glm-4-air", "glm-4-plus"],
+        "models": [
+            "glm-4-flash",
+            "glm-4-air",
+            "glm-5.3-flash",
+        ],
     },
     "DeepSeek": {
         "type": "openai_compatible",
@@ -99,6 +106,17 @@ PROVIDERS = {
         "models": ["moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k"],
     },
 }
+
+MODEL_REGISTRY = {
+    provider_name: info["models"]
+    for provider_name, info in PROVIDERS.items()
+}
+
+def get_validated_model(provider: str, requested_model: str) -> str:
+    supported_models = MODEL_REGISTRY.get(provider, [])
+    if requested_model not in supported_models:
+        return supported_models[0] if supported_models else "gemini-3.6-flash"
+    return requested_model
 
 DEFAULT_SYSTEM = (
     "You are a helpful, intelligent, and concise AI assistant. "
@@ -256,7 +274,8 @@ with st.sidebar:
 
     provider_name = st.selectbox("Provider", list(PROVIDERS.keys()))
     provider = PROVIDERS[provider_name]
-    model_choice = st.selectbox("Model", provider["models"])
+    raw_model_choice = st.selectbox("Model", provider["models"])
+    model_choice = get_validated_model(provider_name, raw_model_choice)
 
     temperature = st.slider("Temperature", 0.0, 1.0, 0.7, 0.05)
     system_prompt = st.text_area("System Instruction", value=DEFAULT_SYSTEM, height=100)
@@ -467,6 +486,9 @@ if submitted:
         if not active_api_key:
             st.error(f"Please configure an API key for {provider_name} in the sidebar settings first.")
             st.stop()
+
+        # Validate active model ID
+        model_choice = get_validated_model(provider_name, model_choice)
 
         # Model Routing Validation: Gemma vs. Gemini / Multimodal models
         is_gemma = "gemma" in model_choice.lower()
