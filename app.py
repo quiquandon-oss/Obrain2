@@ -1,7 +1,7 @@
 """
 Obrain2 – Multi-Provider Multimodal Chat Assistant
-Supports: Google Gemma 4, OpenRouter (Qwen, DeepSeek), image/camera/PDF upload,
-and persistent chat history via Supabase.
+Supports: Google Gemma/Gemini, OpenRouter, Zhipu AI (GLM), DeepSeek, Alibaba Qwen, SiliconFlow, Moonshot (Kimi),
+compact attachment popover & preview chips, persistent API key management, and chat history via Supabase.
 """
 
 import streamlit as st
@@ -17,6 +17,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 
+import key_manager
+
 # ---------------------------------------------------------------------------
 # Page config
 # ---------------------------------------------------------------------------
@@ -27,16 +29,30 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# Helper to safely retrieve st.secrets
+def get_safe_secrets():
+    try:
+        if hasattr(st, "secrets"):
+            _ = len(st.secrets)
+            return st.secrets
+    except Exception:
+        pass
+    return None
+
 # ---------------------------------------------------------------------------
 # Constants & model catalogues
 # ---------------------------------------------------------------------------
 PROVIDERS = {
-    "Google (Gemma 4)": {
+    "Google (Gemma / Gemini)": {
         "type": "google",
-        "models": ["gemma-4-26b-a4b-it", "gemma-4-31b-it"],
+        "key_name": "GEMINI_API_KEY",
+        "base_url": None,
+        "models": ["gemma-4-26b-a4b-it", "gemma-4-31b-it", "gemini-2.5-flash", "gemini-2.5-pro"],
     },
     "OpenRouter": {
-        "type": "openrouter",
+        "type": "openai_compatible",
+        "key_name": "OPENROUTER_API_KEY",
+        "base_url": "https://openrouter.ai/api/v1",
         "models": [
             "google/gemma-4-26b-a4b-it",
             "google/gemma-4-31b-it",
@@ -46,6 +62,41 @@ PROVIDERS = {
             "deepseek/deepseek-reasoner",
             "z-ai/glm-4.5-flash",
         ],
+    },
+    "Zhipu AI (GLM)": {
+        "type": "openai_compatible",
+        "key_name": "ZHIPU_API_KEY",
+        "base_url": "https://open.bigmodel.cn/api/paas/v4",
+        "models": ["glm-4-flash", "glm-4", "glm-4-air", "glm-4-plus"],
+    },
+    "DeepSeek": {
+        "type": "openai_compatible",
+        "key_name": "DEEPSEEK_API_KEY",
+        "base_url": "https://api.deepseek.com/v1",
+        "models": ["deepseek-chat", "deepseek-reasoner"],
+    },
+    "Alibaba Qwen": {
+        "type": "openai_compatible",
+        "key_name": "QWEN_API_KEY",
+        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "models": ["qwen-turbo", "qwen-plus", "qwen-max", "qwen-long"],
+    },
+    "SiliconFlow": {
+        "type": "openai_compatible",
+        "key_name": "SILICONFLOW_API_KEY",
+        "base_url": "https://api.siliconflow.cn/v1",
+        "models": [
+            "Qwen/Qwen2.5-7B-Instruct",
+            "Qwen/Qwen2.5-72B-Instruct",
+            "deepseek-ai/DeepSeek-V2.5",
+            "THUDM/glm-4-9b-chat",
+        ],
+    },
+    "Moonshot (Kimi)": {
+        "type": "openai_compatible",
+        "key_name": "MOONSHOT_API_KEY",
+        "base_url": "https://api.moonshot.cn/v1",
+        "models": ["moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k"],
     },
 }
 
@@ -59,15 +110,41 @@ MAX_FILE_MB = 8          # soft limit per file
 WARN_STORAGE_MB = 400    # warn when total uploaded files approach free tier
 
 # ---------------------------------------------------------------------------
+# Session state initialization
+# ---------------------------------------------------------------------------
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "session_id" not in st.session_state:
+    st.session_state.session_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S") + "-" + str(uuid.uuid4())[:8]
+if "conversation_id" not in st.session_state:
+    st.session_state.conversation_id = None
+if "pending_attachments" not in st.session_state:
+    st.session_state.pending_attachments = []  # list of dicts: {"id": str, "name": str, "type": str, "kind": str, "data": bytes}
+if "ignored_attachment_ids" not in st.session_state:
+    st.session_state.ignored_attachment_ids = set()
+if "uploader_key_version" not in st.session_state:
+    st.session_state.uploader_key_version = 0
+if "validation_status" not in st.session_state:
+    st.session_state.validation_status = {}  # key_name -> (bool, str)
+
+def clear_attachments():
+    st.session_state.pending_attachments = []
+    st.session_state.ignored_attachment_ids = set()
+    st.session_state.uploader_key_version += 1
+
+# ---------------------------------------------------------------------------
 # Supabase helpers
 # ---------------------------------------------------------------------------
 def get_supabase() -> Optional[Client]:
     try:
-        url = st.secrets["supabase"]["SUPABASE_URL"]
-        key = st.secrets["supabase"]["SUPABASE_KEY"]
-        return create_client(url, key)
+        sec = get_safe_secrets()
+        if sec and "supabase" in sec:
+            url = sec["supabase"]["SUPABASE_URL"]
+            key = sec["supabase"]["SUPABASE_KEY"]
+            return create_client(url, key)
     except Exception:
-        return None
+        pass
+    return None
 
 def ensure_conversation(sb: Client, session_id: str) -> str:
     """Return conversation uuid for this session, creating one if needed."""
@@ -102,7 +179,7 @@ def get_total_storage_mb(sb: Client) -> float:
         return 0.0
 
 # ---------------------------------------------------------------------------
-# Sidebar
+# Sidebar & Provider Settings
 # ---------------------------------------------------------------------------
 with st.sidebar:
     st.header("🧠 Obrain2 Settings")
@@ -115,21 +192,60 @@ with st.sidebar:
     system_prompt = st.text_area("System Instruction", value=DEFAULT_SYSTEM, height=100)
 
     st.divider()
-    st.subheader("API Keys (or use Secrets)")
+    st.subheader("🔑 API Key Management")
 
-    try:
-        gemini_key = st.secrets.get("GEMINI_API_KEY")
-    except Exception:
-        gemini_key = None
-    if not gemini_key:
-        gemini_key = st.text_input("Gemini API Key", type="password")
+    safe_sec = get_safe_secrets()
+    active_key_name = provider["key_name"]
+    current_key = key_manager.get_api_key(active_key_name, safe_sec)
 
-    try:
-        openrouter_key = st.secrets.get("OPENROUTER_API_KEY")
-    except Exception:
-        openrouter_key = None
-    if not openrouter_key:
-        openrouter_key = st.text_input("OpenRouter API Key", type="password")
+    if current_key:
+        st.success(f"Status: Configured ({key_manager.mask_key(current_key)})")
+    else:
+        st.warning("Status: Not Configured")
+
+    with st.expander("Manage Provider API Keys", expanded=not bool(current_key)):
+        for name, info in PROVIDERS.items():
+            k_name = info["key_name"]
+            existing_key = key_manager.get_api_key(k_name, safe_sec)
+
+            st.markdown(f"**{name}**")
+            status_icon = "🟢" if existing_key else "⚪"
+            st.caption(f"{status_icon} {'Configured' if existing_key else 'Not set'}")
+
+            new_k = st.text_input(
+                f"Key for {name}",
+                value="",
+                placeholder=key_manager.mask_key(existing_key) if existing_key else "Enter API key...",
+                type="password",
+                key=f"input_{k_name}",
+                label_visibility="collapsed",
+            )
+
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("Save & Test", key=f"save_{k_name}"):
+                    val_to_save = new_k.strip() or existing_key or ""
+                    if val_to_save:
+                        key_manager.save_provider_key(k_name, val_to_save)
+                        is_valid, msg = key_manager.validate_key(
+                            info["type"], info["base_url"], val_to_save
+                        )
+                        st.session_state.validation_status[k_name] = (is_valid, msg)
+                        st.rerun()
+            with c2:
+                if st.button("Revoke", key=f"revoke_{k_name}"):
+                    key_manager.revoke_provider_key(k_name)
+                    if k_name in st.session_state.validation_status:
+                        del st.session_state.validation_status[k_name]
+                    st.rerun()
+
+            if k_name in st.session_state.validation_status:
+                ok, msg = st.session_state.validation_status[k_name]
+                if ok:
+                    st.success(msg)
+                else:
+                    st.error(msg)
+            st.markdown("---")
 
     st.divider()
     use_persistence = st.checkbox("Persist chats to Supabase", value=True)
@@ -141,13 +257,14 @@ with st.sidebar:
             if used_mb > WARN_STORAGE_MB:
                 st.warning("Approaching Supabase free storage limit. Consider deleting old files.")
         else:
-            st.error("Supabase credentials missing in secrets.")
+            st.caption("Supabase credentials not active or not configured in secrets.")
 
     col1, col2 = st.columns(2)
     with col1:
         if st.button("Clear current chat", use_container_width=True):
             st.session_state.messages = []
             st.session_state.conversation_id = None
+            clear_attachments()
             st.rerun()
     with col2:
         if st.session_state.get("messages"):
@@ -164,16 +281,6 @@ with st.sidebar:
                 use_container_width=True,
             )
 
-# ---------------------------------------------------------------------------
-# Session state
-# ---------------------------------------------------------------------------
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "session_id" not in st.session_state:
-    st.session_state.session_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S") + "-" + str(uuid.uuid4())[:8]
-if "conversation_id" not in st.session_state:
-    st.session_state.conversation_id = None
-
 # Load history from Supabase once
 if use_persistence and st.session_state.conversation_id is None:
     sb = get_supabase()
@@ -189,52 +296,131 @@ if use_persistence and st.session_state.conversation_id is None:
 st.title("🧠 Obrain2 AI Assistant")
 st.caption("Multi-provider · Multimodal · Persistent memory")
 
-# Multimodal inputs
-col1, col2 = st.columns(2)
-with col1:
-    uploaded_images = st.file_uploader("Upload images / photos", type=["png", "jpg", "jpeg", "webp"], accept_multiple_files=True)
-with col2:
-    camera_photo = st.camera_input("Take a photo")
-
-uploaded_pdfs = st.file_uploader("Upload PDF documents", type=["pdf"], accept_multiple_files=True)
-
 # Render history
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
 # ---------------------------------------------------------------------------
+# Compact Attachment Popover & Active Attachment Previews
+# ---------------------------------------------------------------------------
+ver = st.session_state.uploader_key_version
+popover_col, clear_col = st.columns([3, 1])
+
+with popover_col:
+    with st.popover("➕ Add Attachments (Images, Camera, PDF)", use_container_width=True):
+        st.markdown("### 📎 Attach Media or Documents")
+
+        tab_img, tab_cam, tab_pdf = st.tabs(["🖼️ Gallery / Photos", "📷 Take Photo", "📄 Documents / PDF"])
+
+        with tab_img:
+            uploaded_imgs = st.file_uploader(
+                "Choose images",
+                type=["png", "jpg", "jpeg", "webp"],
+                accept_multiple_files=True,
+                key=f"popover_img_uploader_v{ver}"
+            )
+            if uploaded_imgs:
+                for f in uploaded_imgs:
+                    file_id = f"img_{f.name}_{f.size}"
+                    if file_id not in st.session_state.ignored_attachment_ids and not any(att["id"] == file_id for att in st.session_state.pending_attachments):
+                        st.session_state.pending_attachments.append({
+                            "id": file_id,
+                            "name": f.name,
+                            "type": f.type or "image/jpeg",
+                            "kind": "image",
+                            "data": f.getvalue()
+                        })
+
+        with tab_cam:
+            cam_pic = st.camera_input("Take a photo", key=f"popover_cam_uploader_v{ver}")
+            if cam_pic:
+                cam_data = cam_pic.getvalue()
+                cam_id = f"cam_{len(cam_data)}"
+                if cam_id not in st.session_state.ignored_attachment_ids and not any(att["id"] == cam_id for att in st.session_state.pending_attachments):
+                    st.session_state.pending_attachments.append({
+                        "id": cam_id,
+                        "name": "Camera_photo.jpg",
+                        "type": "image/jpeg",
+                        "kind": "image",
+                        "data": cam_data
+                    })
+
+        with tab_pdf:
+            uploaded_pdfs = st.file_uploader(
+                "Choose PDF documents",
+                type=["pdf"],
+                accept_multiple_files=True,
+                key=f"popover_pdf_uploader_v{ver}"
+            )
+            if uploaded_pdfs:
+                for pdf in uploaded_pdfs:
+                    pdf_id = f"pdf_{pdf.name}_{pdf.size}"
+                    if pdf_id not in st.session_state.ignored_attachment_ids and not any(att["id"] == pdf_id for att in st.session_state.pending_attachments):
+                        st.session_state.pending_attachments.append({
+                            "id": pdf_id,
+                            "name": pdf.name,
+                            "type": "application/pdf",
+                            "kind": "pdf",
+                            "data": pdf.getvalue()
+                        })
+
+with clear_col:
+    if st.session_state.pending_attachments:
+        if st.button("🗑️ Clear All", use_container_width=True):
+            clear_attachments()
+            st.rerun()
+
+# Display attachment chips above chat input
+if st.session_state.pending_attachments:
+    st.markdown("**Pending Attachments:**")
+    chip_cols = st.columns(min(len(st.session_state.pending_attachments), 4))
+    idx_to_remove = None
+    for idx, att in enumerate(st.session_state.pending_attachments):
+        col = chip_cols[idx % 4]
+        with col:
+            icon = "🖼️" if att["kind"] == "image" else "📄"
+            if st.button(f"❌ {icon} {att['name'][:15]}", key=f"chip_rm_{idx}_{att['id']}"):
+                idx_to_remove = idx
+
+    if idx_to_remove is not None:
+        removed_att = st.session_state.pending_attachments.pop(idx_to_remove)
+        st.session_state.ignored_attachment_ids.add(removed_att["id"])
+        st.rerun()
+
+# ---------------------------------------------------------------------------
 # Chat input & generation
 # ---------------------------------------------------------------------------
 if user_prompt := st.chat_input("Ask anything..."):
-    # Build multimodal content
+    # Current active provider & key
+    safe_sec = get_safe_secrets()
+    provider_key_name = provider["key_name"]
+    active_api_key = key_manager.get_api_key(provider_key_name, safe_sec)
+
+    if not active_api_key:
+        st.error(f"Please configure an API key for {provider_name} in the sidebar settings first.")
+        st.stop()
+
+    # Process attachments in session state
     extra_text_parts = []
     image_parts = []
+    pdf_count = 0
 
-    # Camera
-    if camera_photo is not None:
-        img_bytes = camera_photo.getvalue()
-        image_parts.append(("image/jpeg", img_bytes))
-        extra_text_parts.append("[User provided a camera photo]")
-
-    # Uploaded images
-    if uploaded_images:
-        for f in uploaded_images:
-            image_parts.append((f.type or "image/jpeg", f.getvalue()))
-            extra_text_parts.append(f"[User uploaded image: {f.name}]")
-
-    # PDFs → extract text
-    if uploaded_pdfs:
-        for pdf in uploaded_pdfs:
+    for att in st.session_state.pending_attachments:
+        if att["kind"] == "image":
+            image_parts.append((att["type"], att["data"]))
+            extra_text_parts.append(f"[User attached image: {att['name']}]")
+        elif att["kind"] == "pdf":
+            pdf_count += 1
             try:
-                reader = PdfReader(io.BytesIO(pdf.getvalue()))
+                reader = PdfReader(io.BytesIO(att["data"]))
                 text = "\n".join(page.extract_text() or "" for page in reader.pages)
                 if text.strip():
-                    extra_text_parts.append(f"[Content of PDF {pdf.name}]:\n{text[:12000]}")
+                    extra_text_parts.append(f"[Content of PDF {att['name']}]:\n{text[:12000]}")
                 else:
-                    extra_text_parts.append(f"[PDF {pdf.name} contained no extractable text]")
+                    extra_text_parts.append(f"[PDF {att['name']} contained no extractable text]")
             except Exception as e:
-                extra_text_parts.append(f"[Could not read PDF {pdf.name}: {e}]")
+                extra_text_parts.append(f"[Could not read PDF {att['name']}: {e}]")
 
     full_user_content = user_prompt
     if extra_text_parts:
@@ -246,13 +432,16 @@ if user_prompt := st.chat_input("Ask anything..."):
         st.markdown(user_prompt)
         if image_parts:
             st.caption(f"📎 {len(image_parts)} image(s) attached")
-        if uploaded_pdfs:
-            st.caption(f"📄 {len(uploaded_pdfs)} PDF(s) attached")
+        if pdf_count > 0:
+            st.caption(f"📄 {pdf_count} PDF(s) attached")
 
     if use_persistence and st.session_state.conversation_id:
         sb = get_supabase()
         if sb:
             save_message(sb, st.session_state.conversation_id, "user", full_user_content)
+
+    # Clear pending attachments after sending
+    clear_attachments()
 
     # Generate reply
     with st.chat_message("assistant"):
@@ -263,21 +452,13 @@ if user_prompt := st.chat_input("Ask anything..."):
             assistant_text = ""
 
             if provider["type"] == "google":
-                if not gemini_key:
-                    raise ValueError("Gemini API key required")
-                client = genai.Client(api_key=gemini_key)
+                client = genai.Client(api_key=active_api_key)
 
                 # Build history
                 history = []
                 for m in st.session_state.messages[:-1]:
                     role = "user" if m["role"] == "user" else "model"
                     history.append(types.Content(role=role, parts=[types.Part.from_text(text=m["content"])]))
-
-                # Current turn parts
-                parts = []
-                for mime, data in image_parts:
-                    parts.append(types.Part.from_bytes(data=data, mime_type=mime))
-                parts.append(types.Part.from_text(text=full_user_content))
 
                 chat = client.chats.create(
                     model=model_choice,
@@ -287,17 +468,13 @@ if user_prompt := st.chat_input("Ask anything..."):
                         system_instruction=system_prompt,
                     ),
                 )
-                # For simplicity we send text; images are included in the last user message text context
-                # Full image support via generate_content is also possible
                 response = chat.send_message(full_user_content)
                 assistant_text = response.text or "(empty response)"
 
-            else:  # OpenRouter (OpenAI-compatible)
-                if not openrouter_key:
-                    raise ValueError("OpenRouter API key required")
+            else:  # OpenAI-compatible (OpenRouter, Zhipu, DeepSeek, Qwen, SiliconFlow, Moonshot)
                 client = OpenAI(
-                    base_url="https://openrouter.ai/api/v1",
-                    api_key=openrouter_key,
+                    base_url=provider["base_url"],
+                    api_key=active_api_key,
                 )
                 msgs = [{"role": "system", "content": system_prompt}]
                 for m in st.session_state.messages[:-1]:
@@ -332,8 +509,8 @@ if user_prompt := st.chat_input("Ask anything..."):
             err = str(e)
             if "503" in err or "high demand" in err.lower() or "unavailable" in err.lower():
                 friendly = "Model temporarily overloaded (503). Please try again in a minute or switch model."
-            elif "401" in err or "auth" in err.lower() or "api key" in err.lower():
-                friendly = "Authentication failed. Check your API key."
+            elif "401" in err or "auth" in err.lower() or "api key" in err.lower() or "unauthorized" in err.lower():
+                friendly = "Authentication failed. Check your API key in settings."
             elif "429" in err or "rate" in err.lower() or "quota" in err.lower():
                 friendly = "Rate limit / quota exceeded. Wait or switch provider."
             else:
